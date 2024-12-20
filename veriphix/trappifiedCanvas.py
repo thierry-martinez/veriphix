@@ -69,6 +69,21 @@ class TrappifiedCanvas:
             trap_stabilizer *= self.get_canonical_stabilizer(node)
         return trap_stabilizer
 
+    def merge_pauli_list2(self, pauli_list: list[stim.PauliString]) -> list[stim.PauliString]:
+        l = []
+        # For each src in pauli_list,
+        for src in pauli_list:
+            # Is there a Pauli string in l that can be merged with src?
+            i = next(i for i, tgt in enumerate(l) if common_eigenstate(src, tgt), None)
+            if i is None:
+                # If not, add src to l
+                l.append(src)
+                continue
+            # If it can me merged, then do it!
+            l[i] = merge(src, l[i])
+        return l
+            
+
     def merge_pauli_list(self, pauli_list) -> stim.PauliString:
         """
         If the protocol is coherent, all the stabilizers should be able to merge in one Pauli string.
