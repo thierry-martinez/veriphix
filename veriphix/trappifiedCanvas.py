@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from typing import TYPE_CHECKING
 
 import stim
@@ -11,6 +10,7 @@ from graphix.rng import ensure_rng
 if TYPE_CHECKING:
     import networkx as nx
     from graphix.states import State
+    from numpy.random import Generator
 
     Trap = set[int]
 
@@ -47,7 +47,7 @@ class TrapStabilizers:
 
     def pick_random_coins_dummies(self, rng: Generator | None = None) -> dict[int, bool]:
         rng = ensure_rng(rng)
-        coins = { node: bool(rng.integers(2)) if node not in self.trap_qubits else False for node in self.graph.nodes }
+        coins = {node: bool(rng.integers(2)) if node not in self.trap_qubits else False for node in self.graph.nodes}
         for node in self.trap_qubits:
             coins[node] = bool(sum(coins[n] for n in self.graph.neighbors(node)) % 2)
         return coins
