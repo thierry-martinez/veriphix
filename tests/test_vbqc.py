@@ -1,61 +1,200 @@
+from __future__ import annotations
+
+import json
 import random
-import unittest
-from collections import defaultdict
-from copy import deepcopy
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
-import networkx as nx
+import graphix.command
 import numpy as np
-
-import graphix.gflow
-import graphix.pauli
-import graphix.visualization
-import tests.random_circuit as rc
-from veriphix.client import TrappifiedCanvas
+import pytest
+from graphix.noise_models import DepolarisingNoiseModel
+from graphix.random_objects import rand_circuit
+from graphix.sim.density_matrix import DensityMatrixBackend
 from graphix.sim.statevec import StatevectorBackend
 from graphix.states import BasicStates
 
+import veriphix.sampling_circuits.brickwork_state_transpiler
+from veriphix.client import Client, Secrets, TrappifiedSchemeParameters
+from veriphix.run import ComputationRun
+from veriphix.sampling_circuits.qasm_parser import read_qasm
+
+if TYPE_CHECKING:
+    from graphix.pattern import Pattern
+    from numpy.random import Generator
+
+
+def load_pattern_from_circuit(circuit_label: str) -> tuple[Pattern, list[int]]:
+    with Path(f"circuits/{circuit_label}").open() as f:
+        circuit = read_qasm(f)
+        pattern = veriphix.sampling_circuits.brickwork_state_transpiler.transpile(circuit)
+
+        pattern.minimize_space()
+    return pattern
+
 
 class TestVBQC:
-
     def test_trap_delegated(self, fx_rng: np.random.Generator):
-        nqubits = 2
-        depth = 2
-        circuit = rc.get_rand_circuit(nqubits, depth, fx_rng)
+        nqubits = 3
+        depth = 5
+        circuit = rand_circuit(nqubits, depth, fx_rng)
         pattern = circuit.transpile().pattern
-        pattern.standardize()
+        # pattern.standardize()
+        # don't forget to add in the output nodes that are not initially measured!
+        for onode in pattern.output_nodes:
+            pattern.add(graphix.command.M(node=onode))
+
         states = [BasicStates.PLUS for _ in pattern.input_nodes]
-        secrets = graphix.client.Secrets(r=True, a=True, theta=True)
-        client = graphix.client.Client(pattern=pattern, input_state=states, secrets=secrets)
-        test_runs, _ = client.create_test_runs()
-        for run in test_runs:
+        secrets = Secrets(r=True, a=True, theta=True)
+        client = Client(pattern=pattern, input_state=states, secrets=secrets)
+        for test_run in client.test_runs:
             backend = StatevectorBackend()
-            trap_outcomes = client.delegate_test_run(backend=backend, run=run)
-            assert trap_outcomes == [0 for _ in run.traps_list]
+            trap_outcomes = test_run.delegate(backend=backend)
+            assert sum(trap_outcomes.values()) == 0
 
-    def test_stabilizer(self, fx_rng: np.random.Generator):
-        nqubits = 2
-        depth = 2
-        circuit = rc.get_rand_circuit(nqubits, depth, fx_rng)
+    def test_sample_canvas(self, fx_rng: Generator):
+        nqubits = 3
+        depth = 5
+        circuit = rand_circuit(nqubits, depth, fx_rng)
         pattern = circuit.transpile().pattern
-        pattern.standardize()
-        nodes, edges = pattern.get_graph()[0], pattern.get_graph()[1]
-        graph = nx.Graph()
-        graph.add_nodes_from(nodes)
-        graph.add_edges_from(edges)
 
-        import random
+        states = [BasicStates.PLUS for _ in pattern.input_nodes]
+        secrets = Secrets(r=True, a=True, theta=True)
+        client = Client(pattern=pattern, input_state=states, secrets=secrets)
 
-        k = random.randint(0, len(graph.nodes) - 1)
-        nodes_sample = random.sample(list(graph.nodes), k)
-        # nodes_sample=[0]
+        assert client.sample_canvas()
+        # Just tests that it runs
 
-        stabilizer = graphix.client.Stabilizer(graph=graph, nodes=nodes_sample)
+    def test_delegate_canvas(self, fx_rng: Generator):
+        nqubits = 3
+        depth = 5
+        circuit = rand_circuit(nqubits, depth, fx_rng)
+        pattern = circuit.transpile().pattern
 
-        expected_stabilizer = [graphix.pauli.I for _ in graph.nodes]
-        for node in nodes_sample:
-            expected_stabilizer[node] @= graphix.pauli.X
-            for n in graph.neighbors(node):
-                expected_stabilizer[n] @= graphix.pauli.Z
+        svbackend = StatevectorBackend()
+        simulated_pattern_output = pattern.simulate_pattern(backend=svbackend)
+        simulated_circuit_output = circuit.simulate_statevector().statevec
 
-        assert expected_stabilizer == stabilizer.chain
+        states = [BasicStates.PLUS for _ in pattern.input_nodes]
+        secrets = Secrets(r=True, a=True, theta=True)
+
+        parameters = TrappifiedSchemeParameters(comp_rounds=10, test_rounds=10, threshold=0)
+        client = Client(
+            pattern=pattern, input_state=states, secrets=secrets, parameters=parameters, classical_output=False
+        )
+
+        backend = StatevectorBackend()
+
+        canvas = client.sample_canvas()
+        outcomes = client.delegate_canvas(canvas=canvas, backend=backend)
+        for r in canvas:
+            if isinstance(canvas[r], ComputationRun):
+                np.testing.assert_almost_equal(
+                    np.abs(np.dot(outcomes[r].psi.flatten().conjugate(), simulated_pattern_output.psi.flatten())), 1
+                )
+                np.testing.assert_almost_equal(
+                    np.abs(np.dot(outcomes[r].psi.flatten().conjugate(), simulated_circuit_output.psi.flatten())), 1
+                )
+        # Just tests that it runs
+        """
+        TODO, in the tests:
+        - Noiseless, quantum outputs: check evolution of the state for all the comp. runs, and check for no trap failures
+        """
+
+    def test_analyze_outcomes(self, fx_rng: Generator):
+        nqubits = 3
+        depth = 3
+        circuit = rand_circuit(nqubits, depth, fx_rng)
+        pattern = circuit.transpile().pattern
+
+        states = [BasicStates.PLUS for _ in pattern.input_nodes]
+        secrets = Secrets(r=True, a=True, theta=True)
+
+        parameters = TrappifiedSchemeParameters(comp_rounds=50, test_rounds=50, threshold=10)
+        client = Client(pattern=pattern, input_state=states, secrets=secrets, parameters=parameters)
+
+        backend = StatevectorBackend()
+
+        canvas = client.sample_canvas()
+        outcomes = client.delegate_canvas(canvas=canvas, backend=backend)
+
+        # only for BQP
+        assert client.analyze_outcomes(canvas, outcomes)
+
+    @pytest.mark.parametrize("blind", (False, True))
+    def test_BQP_circuit(self, fx_rng: Generator, blind: bool):
+        bqp_error = 0.3
+        with Path("circuits/table.json").open() as f:
+            table = json.load(f)
+            circuits = [name for name, prob in table.items() if prob < bqp_error or prob > 1 - bqp_error]
+        random_circuit_label = random.choice(circuits)
+        # Example of deterministic circuit with output 0
+        pattern = load_pattern_from_circuit(circuit_label=random_circuit_label)
+
+        states = [BasicStates.PLUS for _ in pattern.input_nodes]
+        secrets = Secrets(r=blind, a=blind, theta=blind)
+
+        parameters = TrappifiedSchemeParameters(comp_rounds=20, test_rounds=20, threshold=5)
+        # QCircuit, we keep the first output only
+        desired_outputs = [0]
+        client = Client(
+            pattern=pattern, input_state=states, secrets=secrets, parameters=parameters, desired_outputs=desired_outputs
+        )
+        backend = StatevectorBackend()
+
+        canvas = client.sample_canvas()
+        outcomes = client.delegate_canvas(canvas=canvas, backend=backend)
+        decision, result = client.analyze_outcomes(canvas, outcomes)
+        assert decision
+        assert result != "Abort"
+        assert int(result) == find_correct_value(random_circuit_label)
+
+    @pytest.mark.parametrize("blind", (False, True))
+    def test_noiseless(self, fx_rng: Generator, blind: bool):
+        nqubits = 3
+        depth = 3
+        circuit = rand_circuit(nqubits, depth, fx_rng)
+        pattern = circuit.transpile().pattern
+
+        states = [BasicStates.PLUS for _ in pattern.input_nodes]
+
+        secrets = Secrets(a=blind, r=blind, theta=blind)
+
+        client = Client(pattern=pattern, input_state=states, secrets=secrets)
+        noise_model = DepolarisingNoiseModel(
+            measure_error_prob=0, entanglement_error_prob=0, x_error_prob=0, z_error_prob=0, measure_channel_prob=0
+        )
+        for test_run in client.test_runs:
+            client.refresh_randomness()
+            backend = DensityMatrixBackend(rng=fx_rng)
+            trap_outcomes = test_run.delegate(backend=backend, noise_model=noise_model)
+            assert sum(trap_outcomes.values()) == 0
+
+    def test_noisy(self, fx_rng: Generator):
+        nqubits = 3
+        depth = 3
+        circuit = rand_circuit(nqubits, depth, fx_rng)
+        pattern = circuit.transpile().pattern
+
+        states = [BasicStates.PLUS for _ in pattern.input_nodes]
+
+        secrets = Secrets(a=True, r=True, theta=True)
+
+        client = Client(pattern=pattern, input_state=states, secrets=secrets)
+        noise_model = DepolarisingNoiseModel(
+            measure_error_prob=1, entanglement_error_prob=1, x_error_prob=1, z_error_prob=1, measure_channel_prob=1
+        )
+        for test_run in client.test_runs:
+            backend = DensityMatrixBackend(rng=fx_rng)
+            client.refresh_randomness()
+            trap_outcomes = test_run.delegate(backend=backend, noise_model=noise_model)
+            assert sum(trap_outcomes.values()) > 0
+
+
+def find_correct_value(circuit_name):
+    with Path("circuits/table.json").open() as f:
+        table = json.load(f)
+        # return 1 if yes instance
+        # return 0 else (no instance, as circuits are already filtered)
+        # print(table[circuit_name])
+        return round(table[circuit_name])
