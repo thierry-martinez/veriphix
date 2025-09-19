@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import typing
-from copy import deepcopy
+import random
 from dataclasses import dataclass
-
-import networkx as nx
-import numpy as np
+from math import ceil
+from typing import TYPE_CHECKING
 
 import graphix.command
 import graphix.ops
@@ -14,214 +12,35 @@ import graphix.pauli
 import graphix.sim.base_backend
 import graphix.sim.statevec
 import graphix.simulator
-from graphix.clifford import CLIFFORD, CLIFFORD_CONJ, CLIFFORD_MUL
-from graphix.command import CommandKind
+import networkx as nx
+import numpy as np
+from graphix.clifford import Clifford
+from graphix.command import BaseM, BaseN, CommandKind, MeasureUpdate
+from graphix.fundamentals import Plane
+from graphix.measurements import Measurement
+from graphix.ops import Ops
 from graphix.pattern import Pattern
-from graphix.pauli import Plane
-from graphix.sim.base_backend import Backend
-from graphix.sim.base_backend import State as BackendState
-from graphix.simulator import MeasureMethod, PatternSimulator
-from graphix.states import BasicStates, PlanarState, State
+from graphix.sim.statevec import Statevec
+from graphix.simulator import MeasureMethod, PrepareMethod
+from graphix.states import BasicStates
+from stim import Circuit
 
-"""
-Usage:
+from veriphix.blinding import SecretDatas, Secrets
+from veriphix.malicious_noise_model import MaliciousNoiseModel
+from veriphix.protocols import FK12, VerificationProtocol
+from veriphix.verifying import (
+    ComputationRun,
+    ResultAnalysis,
+    Run,
+    RunResult,
+    TrappifiedScheme,
+    TrappifiedSchemeParameters,
+)
 
-client = Client(pattern:Pattern, blind=False) ## For pure MBQC
-sv_backend = StatevecBackend(client.pattern, meas_op = client.meas_op)
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-simulator = PatternSimulator(client.pattern, backend=sv_backend)
-simulator.run()
-
-"""
-
-
-@dataclass
-class TrappifiedRun:
-    input_state: list
-    tested_qubits: list[int]
-    stabilizer: graphix.pauli
-
-
-@dataclass
-class Secret_a:
-    a: dict[int, int]
-    a_N: dict[int, int]
-
-
-@dataclass
-class Secrets:
-    r: bool = False
-    a: bool = False
-    theta: bool = False
-
-
-@dataclass
-class SecretDatas:
-    r: dict[int, int]
-    a: Secret_a
-    theta: dict[int, int]
-
-    @staticmethod
-    def from_secrets(secrets: Secrets, graph, input_nodes, output_nodes):
-        node_list, edge_list = graph
-        r = {}
-        if secrets.r:
-            # Need to generate the random bit for each measured qubit, 0 for the rest (output qubits)
-            for node in node_list:
-                r[node] = np.random.randint(0, 2) if node not in output_nodes else 0
-
-        theta = {}
-        if secrets.theta:
-            # Create theta secret for all non-output nodes (measured qubits)
-            for node in node_list:
-                theta[node] = np.random.randint(0, 8) if node not in output_nodes else 0  # Expressed in pi/4 units
-
-        a = {}
-        a_N = {}
-        if secrets.a:
-            # Create `a` secret for all
-            for node in node_list:
-                a[node] = np.random.randint(0, 2)
-
-            # After all the `a` secrets have been generated, the `a_N` value can be
-            # computed from the graph topology
-            for i in node_list:
-                a_N_value = 0
-                for j in node_list:
-                    if (i, j) in edge_list or (j, i) in edge_list:
-                        a_N_value ^= a[j]
-                a_N[i] = a_N_value
-
-        return SecretDatas(r, Secret_a(a, a_N), theta)
-
-
-## TODO : extract somewhere else
-import random
-
-
-class Stabilizer:
-    def __init__(self, graph: nx.Graph, nodes: list[int]) -> None:
-        """
-        Builds a multi-qubit Pauli operator from a list of nodes, computing the product of canonical stabilizer generators of the desired nodes
-
-        graph : Instance of networkx.Graph, the underlying graph
-        nodes : list of nodes, to take the product of their associated canonical stabilizers
-        """
-        self.graph = graph
-        self.nodes = nodes
-        self.chain: list[graphix.pauli.Pauli] = [graphix.pauli.I for _ in self.graph.nodes]
-        self.init_chain(nodes)
-
-    @property
-    def size(self) -> int:
-        return len(self.graph.nodes)
-
-    @property
-    def span(self) -> set[int]:
-        """
-        Return the nodes involved in the stabilizer product, and their neighbors, in the same set
-        Equivalent to return the node indices where the Pauli isn't the identity
-        """
-        span = set(self.nodes)
-        for node in self.nodes:
-            for neighbor in self.graph.neighbors(node):
-                span.add(neighbor)
-        return span
-
-    def init_chain(self, nodes):
-        for node in nodes:
-            self.compute_product(node)
-
-    def compute_product(self, node):
-        """
-        Computes the product of the current stabilizer with the canonical generator of a given node
-        A canonical generator for a node is : X on the node, Z on the neighbors
-        The underlying graph structure helps to match the node indices
-        """
-        self.chain[node] @= graphix.pauli.X
-        for neighbor in self.graph.neighbors(node):
-            self.chain[neighbor] @= graphix.pauli.Z
-
-    def __repr__(self) -> str:
-        string = f"""
-        Product stabilizer of nodes in {self.nodes}\n
-        For graph with edges {self.graph.edges}\n
-        """
-        for node in sorted(self.graph.nodes):
-            string += f"{node} {self.chain[node]}\n"
-
-        return string
-
-
-class TrappifiedCanvas:
-    def __init__(self, graph: nx.Graph, traps_list: list[list[int]]) -> None:
-        self.graph = graph
-        self.traps_list = traps_list
-        stabilizers = [Stabilizer(graph, trap_nodes) for trap_nodes in traps_list]
-        self.stabilizer = self.merge_stabilizers(stabilizers)
-        print(self.stabilizer)
-        dummies_coins = self.generate_coins_dummies()
-        self.coins = self.generate_coins_trap_qubits(coins=dummies_coins)
-        self.spans = dict(zip(self.trap_qubits, [stabilizer.span for stabilizer in stabilizers]))
-        self.states = self.generate_eigenstate()
-
-    @property
-    def trap_qubits(self):
-        return [node for trap in self.traps_list for node in trap]
-
-    @property
-    def dummy_qubits(self):
-        return [neighbor for trap in self.traps_list for node in trap for neighbor in list(self.graph.neighbors(node))]
-
-    def merge_stabilizers(self, stabilizers: list[Stabilizer]):
-        common_stabilizer = Stabilizer(self.graph, [])
-        for stabilizer in stabilizers:
-            for node in stabilizer.span:
-                # If the Pauli was identity, just replace it by the upcoming Pauli
-                if common_stabilizer.chain[node] == graphix.pauli.I:
-                    common_stabilizer.chain[node] = stabilizer.chain[node]
-                else:
-                    # If the Pauli wasn't identity, the incoming Pauli must coincide with the previous one
-                    # otherwise it's dramatic
-                    if common_stabilizer.chain[node] != stabilizer.chain[node]:
-                        print("Huge error")
-                        return
-                    else:
-                        # (nothing to do as they already coincide)
-                        pass
-            common_stabilizer.nodes += stabilizer.nodes
-        return common_stabilizer
-
-    def generate_eigenstate(self) -> list[State]:
-        states = []
-        for node in sorted(self.stabilizer.graph.nodes):
-            operator = self.stabilizer.chain[node]
-            states.append(operator.get_eigenstate(eigenvalue=self.coins[node]))
-        return states
-
-    def generate_coins_dummies(self):
-        coins = dict()
-        for node in self.stabilizer.graph.nodes:
-            if node not in self.trap_qubits:
-                coins[node] = random.randint(0, 1)
-            else:
-                coins[node] = 0
-        return coins
-
-    def generate_coins_trap_qubits(self, coins):
-        for node in self.trap_qubits:
-            neighbors_coins = sum(coins[n] for n in self.stabilizer.graph.neighbors(node)) % 2
-            coins[node] = neighbors_coins
-        return coins
-
-    def __repr__(self) -> str:
-        text = ""
-        for node in sorted(self.stabilizer.graph.nodes):
-            trap_span = ""
-            if node in self.trap_qubits:
-                trap_span += f"{self.spans[node]}"
-            text += f"{node} {self.stabilizer.chain[node]} ^ {self.coins[node]} {trap_span} -> {self.states[node]}\n"
-        return text
+    from graphix.sim.base_backend import Backend
 
 
 @dataclass
@@ -252,174 +71,267 @@ def remove_flow(pattern):
             continue
         if cmd.kind == CommandKind.M:
             # If measure, remove measure parameters
-            new_cmd = graphix.command.M(node=cmd.node)
+            new_cmd = graphix.command.BaseM(node=cmd.node)
         else:
             new_cmd = cmd
         clean_pattern.add(new_cmd)
     return clean_pattern
 
 
+def get_graph_clifford_structure(graph: nx.Graph):
+    circuit = Circuit()
+    for edge in graph.edges:
+        i, j = edge
+        circuit.append_from_stim_program_text(f"CZ {i} {j}")
+    return circuit.to_tableau()
+
+
+def qCircuit_predicate(output_string: str) -> bool:
+    return int(output_string[0])
+
+
 class Client:
-    def __init__(self, pattern, input_state=None, measure_method_cls=None, secrets=None):
-        self.initial_pattern = pattern
+    def __init__(
+        self,
+        pattern,
+        input_state=None,
+        classical_output: bool = True,
+        output_predicate: Callable[[str], bool] = qCircuit_predicate,
+        measure_method_cls=None,
+        test_measure_method_cls=None,
+        secrets: Secrets | None = None,
+        parameters: TrappifiedSchemeParameters | None = None,
+        protocol: VerificationProtocol | None = None,
+        autogen: bool = True,
+    ) -> None:
+        self.initial_pattern: Pattern = pattern
+        self.classical_output = classical_output
+        self.output_predicate = output_predicate
+        self.input_nodes = pattern.input_nodes.copy()
+        self.output_nodes = pattern.output_nodes.copy()
+        self.input_state = input_state or [BasicStates.PLUS for _ in self.input_nodes]
+        self.protocol = protocol or FK12()
+        self.parameters = parameters
+        if autogen:
+            self.preprocess_pattern(classical_output=classical_output)
+            self.create_blind_patterns(
+                measure_method_cls=measure_method_cls, test_measure_method_cls=test_measure_method_cls, secrets=secrets
+            )
+            self.create_trappified_scheme()
 
-        self.input_nodes = self.initial_pattern.input_nodes.copy()
-        self.output_nodes = self.initial_pattern.output_nodes.copy()
-        self.graph = self.initial_pattern.get_graph()
-        self.nodes_list = self.graph[0]
+    def preprocess_pattern(self, classical_output: bool = True):
+        if classical_output:
+            self._add_measurement_commands(self.initial_pattern)
 
-        # Copy the pauli-preprocessed nodes' measurement outcomes
-        self.results = pattern.results.copy()
-        if measure_method_cls is None:
-            measure_method_cls = ClientMeasureMethod
-        self.measure_method = measure_method_cls(self)
+        self.graph = self._build_graph()
+        self.clifford_structure = get_graph_clifford_structure(self.graph)
 
-        self.measurement_db = {measure.node: measure for measure in pattern.get_measurement_commands()}
-        self.byproduct_db = get_byproduct_db(pattern)
+        self.results = self.initial_pattern.results.copy()
 
-        if secrets is None:
-            secrets = Secrets()
-        self.secrets = SecretDatas.from_secrets(secrets, self.graph, self.input_nodes, self.output_nodes)
+    def create_blind_patterns(
+        self, measure_method_cls=None, test_measure_method_cls=None, secrets: Secrets | None = None
+    ):
+        self.measure_method = (measure_method_cls or ClientMeasureMethod)(self)
+        self.test_measure_method = (test_measure_method_cls or TestMeasureMethod)(self)
 
-        pattern_without_flow = remove_flow(pattern)
-        self.clean_pattern = pattern_without_flow.prepared_nodes_as_input_nodes()
+        self.measurement_db = self._get_measurement_db()
+        self.byproduct_db = get_byproduct_db(self._copy_pattern())
 
-        self.input_state = input_state if input_state != None else [BasicStates.PLUS for _ in self.input_nodes]
+        self.secrets = secrets or Secrets()
+        self.secret_datas = SecretDatas.from_secrets(self.secrets, self.graph, self.input_nodes, self.output_nodes)
 
-    def blind_qubits(self, backend: Backend) -> None:
-        z_rotation = lambda theta: np.array([[1, 0], [0, np.exp(1j * theta * np.pi / 4)]])
-        x_blind = lambda a: graphix.pauli.X if (a == 1) else graphix.pauli.I
-        for node in self.nodes_list:
-            theta = self.secrets.theta.get(node, 0)
-            a = self.secrets.a.a.get(node, 0)
-            backend.apply_single(node=node, op=x_blind(a).matrix)
-            backend.apply_single(node=node, op=z_rotation(theta))
+        self.clean_pattern = remove_flow(self.initial_pattern)
+        if not self.classical_output:
+            self.test_pattern = self._add_measurement_commands(remove_flow(self.initial_pattern))
+        else:
+            self.test_pattern = self.clean_pattern
+        self.computation_states = self.get_computation_states()
 
-    def prepare_states(self, backend: Backend) -> None:
-        # First prepare inputs
-        backend.add_nodes(nodes=self.input_nodes, data=self.input_state)
+        self.preparation_bank = {}
+        self.prepare_method = ClientPrepareMethod(self.preparation_bank)
 
-        # Then iterate over auxiliaries required to blind
-        aux_nodes = []
-        for node in self.nodes_list:
-            if node not in self.input_nodes and node not in self.output_nodes:
-                aux_nodes.append(node)
-        aux_data = [BasicStates.PLUS for _ in aux_nodes]
-        backend.add_nodes(nodes=aux_nodes, data=aux_data)
+    def create_trappified_scheme(self) -> TrappifiedScheme:
+        self.computationRun = ComputationRun(self)
+        self.test_runs = self.protocol.create_test_runs(client=self)
+        self.trappifiedScheme = TrappifiedScheme(
+            params=self.parameters or TrappifiedSchemeParameters(20, 20, 5), test_runs=self.test_runs
+        )
 
-        # Prepare outputs
-        output_data = []
-        for node in self.output_nodes:
-            r_value = self.secrets.r.get(node, 0)
-            a_N_value = self.secrets.a.a_N.get(node, 0)
-            output_data.append(BasicStates.PLUS if r_value ^ a_N_value == 0 else BasicStates.MINUS)
-        backend.add_nodes(nodes=self.output_nodes, data=output_data)
+    @property
+    def nodes(self) -> list:
+        return list(self.graph.nodes)
 
-    def create_test_runs(self) -> tuple[list[TrappifiedCanvas], dict[int, int]]:
+    def _add_measurement_commands(self, pattern):
+        for onode in self.output_nodes:
+            pattern.add(graphix.command.M(node=onode))
+        return pattern
+
+    def _build_graph(self):
+        raw_graph = self.initial_pattern.get_graph()
         graph = nx.Graph()
-        nodes, edges = self.graph
-        graph.add_edges_from(edges)
-        graph.add_nodes_from(nodes)
+        graph.add_nodes_from(raw_graph[0])
+        graph.add_edges_from(raw_graph[1])
+        return graph
 
-        # Create the graph coloring
-        coloring = nx.coloring.greedy_color(graph, strategy="largest_first")
-        colors = set(coloring.values())
-        nodes_by_color = {c: [] for c in colors}
-        for node in sorted(graph.nodes):
-            color = coloring[node]
-            nodes_by_color[color].append(node)
+    def _copy_pattern(self) -> Pattern:
+        pattern_copy = Pattern(self.initial_pattern.input_nodes)
+        for cmd in self.initial_pattern:
+            pattern_copy.add(cmd)
+        pattern_copy.standardize()
+        return pattern_copy
 
-        # Create the test runs : one per color
-        runs: list[TrappifiedCanvas] = []
-        for color in colors:
-            # 1 color = 1 test run = 1 set of traps = 1 stabilizer
-            trap_qubits = nodes_by_color[color]
-            isolated_traps = [[node] for node in trap_qubits]
-            trappified_canvas = TrappifiedCanvas(graph, traps_list=isolated_traps)
+    def _get_measurement_db(self):
+        copied_pattern = self._copy_pattern()
+        return {m.node: m for m in copied_pattern.get_measurement_commands()}
 
-            runs.append(trappified_canvas)
-        return runs, coloring
+    def refresh_randomness(self) -> None:
+        "method to refresh random randomness using parameters from Clinent instatiation."
 
-    def delegate_test_run(self, backend: Backend, run: TrappifiedCanvas) -> list[int]:
-        # The state is entirely prepared and blinded by the client before being sent to the server
-        backend.add_nodes(nodes=sorted(self.graph[0]), data=run.states)
-        self.blind_qubits(backend)
+        # refresh only if secrets bool is True; False is no randomness at all.
+        if self.secrets is not None:
+            self.secret_datas = SecretDatas.from_secrets(self.secrets, self.graph, self.input_nodes, self.output_nodes)
 
-        # Modify the pattern to be all X-basis measurements, no shifts/signalling updates
-        for node in self.measurement_db:
-            self.measurement_db[node] = graphix.command.M(node=node)
+    def get_computation_states(self):
+        states = dict()
+        for node in self.graph.nodes:
+            if node in self.input_nodes:
+                state = self.input_state[node]
 
-        sim = PatternSimulator(backend=backend, pattern=self.clean_pattern, measure_method=self.measure_method)
-        sim.run(input_state=None)
+            elif node in self.output_nodes:
+                r_value = self.secret_datas.r.get(node, 0)
+                a_N_value = self.secret_datas.a.a_N.get(node, 0)
+                state = BasicStates.PLUS if r_value ^ a_N_value == 0 else BasicStates.MINUS
 
-        trap_outcomes = []
-        for trap in run.traps_list:
-            outcomes = [self.results.get(component, 0) for component in trap]
-            trap_outcome = sum(outcomes) % 2
-            trap_outcomes.append(trap_outcome)
+            else:
+                state = BasicStates.PLUS
+            states[node] = state
+        return states
 
-        return trap_outcomes
+    def prepare_states_virtual(self, states_dict: dict[(int, BasicStates)]) -> None:
+        """
+        The Client creates the qubits and blind them in its preparation_bank
+        """
+        for node in states_dict:
+            blinded_qubit_state = self.secret_datas.blind_qubit(node=node, state=states_dict[node])
+            self.preparation_bank[node] = Statevec(blinded_qubit_state)
 
-    def delegate_pattern(self, backend: Backend) -> PatternSimulator:
-        self.prepare_states(backend)
-        self.blind_qubits(backend)
-        sim = PatternSimulator(backend=backend, pattern=self.clean_pattern, measure_method=self.measure_method)
-        sim.run(input_state=None)
-        self.decode_output_state(backend)
-        # returns the final state
-        return sim
+    def prepare_states(self, backend: Backend, states_dict: dict[(int, BasicStates)]) -> None:
+        # Initializes the bank (all the nodes)
+        self.prepare_states_virtual(states_dict=states_dict)
+        # Server asks the backend to create them
+        ## Except for the input! The Client creates them itself
+        for node in self.input_nodes:
+            self.prepare_method.prepare_node(backend, node)
+
+    def sample_canvas(self):
+        N = self.trappifiedScheme.params.comp_rounds + self.trappifiedScheme.params.test_rounds
+        computation_rounds = set(random.sample(range(N), self.trappifiedScheme.params.comp_rounds))
+
+        return {r: self.computationRun if r in computation_rounds else random.choice(self.test_runs) for r in range(N)}
+
+    def delegate_canvas(self, canvas: dict[int, Run], backend_cls: type[Backend], **kwargs) -> dict[int, RunResult]:
+        outcomes = dict()
+        noise_model = kwargs.get("noise_model")
+        for r in canvas:
+            backend = backend_cls()
+            if isinstance(noise_model, MaliciousNoiseModel):
+                noise_model.refresh_randomness()
+            outcomes[r] = canvas[r].delegate(backend=backend, **kwargs)
+        return outcomes
+
+    def analyze_outcomes(self, canvas, outcomes: dict[int, RunResult]) -> tuple[bool, bool, ResultAnalysis]:
+        result_analysis = ResultAnalysis()
+        for r in canvas:
+            outcomes[r].analyze(result_analysis=result_analysis, client=self)
+
+        # True if Accept, False if Reject
+        traps_decision = result_analysis.nr_failed_test_rounds <= self.trappifiedScheme.params.threshold
+        # The Client decides that the instance passes the predicate if more than half of the test rounds did pass
+        computation_decision = result_analysis.computation_count >= ceil(self.trappifiedScheme.params.comp_rounds / 2)
+
+        return traps_decision, computation_decision, result_analysis
 
     def decode_output_state(self, backend: Backend):
         for node in self.output_nodes:
             z_decoding, x_decoding = self.decode_output(node)
             if z_decoding:
-                backend.apply_single(node=node, op=graphix.ops.Ops.z)
+                backend.apply_single(node=node, op=Ops.Z)
             if x_decoding:
-                backend.apply_single(node=node, op=graphix.ops.Ops.x)
+                backend.apply_single(node=node, op=Ops.X)
 
     def get_secrets_size(self):
         secrets_size = {}
-        for secret in self.secrets:
-            secrets_size[secret] = len(self.secrets[secret])
+        for secret in self.secret_datas:
+            secrets_size[secret] = len(self.secret_datas[secret])
         return secrets_size
 
     def decode_output(self, node):
         z_decoding = sum(self.results[z_dep] for z_dep in self.byproduct_db[node].z_domain) % 2
-        z_decoding ^= self.secrets.r.get(node, 0)
+        z_decoding ^= self.secret_datas.r.get(node, 0)
         x_decoding = sum(self.results[x_dep] for x_dep in self.byproduct_db[node].x_domain) % 2
-        x_decoding ^= self.secrets.a.a.get(node, 0)
+        x_decoding ^= self.secret_datas.a.a.get(node, 0)
         return z_decoding, x_decoding
+
+
+class ClientPrepareMethod(PrepareMethod):
+    def __init__(self, preparation_bank):
+        self.__preparation_bank = preparation_bank
+
+    def prepare_node(self, backend: Backend, node: int) -> None:
+        """Prepare a node."""
+        backend.add_nodes(nodes=[node], data=self.__preparation_bank[node])
+
+    def prepare(self, backend: Backend, cmd: BaseN) -> None:
+        """Prepare a node."""
+        self.prepare_node(backend, cmd.node)
 
 
 class ClientMeasureMethod(MeasureMethod):
     def __init__(self, client: Client):
         self.__client = client
 
-    def get_measurement_description(self, cmd) -> graphix.simulator.MeasurementDescription:
+    def get_measurement_description(self, cmd: BaseM) -> Measurement:
         parameters = self.__client.measurement_db[cmd.node]
 
-        r_value = self.__client.secrets.r.get(cmd.node, 0)
-        theta_value = self.__client.secrets.theta.get(cmd.node, 0)
-        a_value = self.__client.secrets.a.a.get(cmd.node, 0)
-        a_N_value = self.__client.secrets.a.a_N.get(cmd.node, 0)
+        # Extract secrets from Client
+        a_value = self.__client.secret_datas.a.a.get(cmd.node, 0)
 
-        # extract signals for adaptive angle
+        # Extract signals and compute the angle for the computation
         s_signal = sum(self.__client.results[j] for j in parameters.s_domain)
         t_signal = sum(self.__client.results[j] for j in parameters.t_domain)
-        measure_update = graphix.pauli.MeasureUpdate.compute(
-            parameters.plane, s_signal % 2 == 1, t_signal % 2 == 1, graphix.clifford.TABLE[parameters.vop]
-        )
+        measure_update = MeasureUpdate.compute(parameters.plane, s_signal % 2 == 1, t_signal % 2 == 1, Clifford.I)
         angle = parameters.angle * np.pi
         angle = angle * measure_update.coeff + measure_update.add_term
-        angle = (-1) ** a_value * angle + theta_value * np.pi / 4 + np.pi * (r_value + a_N_value)
-        # angle = angle * measure_update.coeff + measure_update.add_term
-        return graphix.simulator.MeasurementDescription(measure_update.new_plane, angle)
-        # return graphix.sim.base_backend.MeasurementDescription(measure_update.new_plane, angle)
+
+        # Blind the angle using the Client's secrets
+        angle = (-1) ** a_value * angle + self.__client.secret_datas.blind_angle(
+            cmd.node, cmd.node in self.__client.output_nodes, test=False
+        )
+        return Measurement(plane=measure_update.new_plane, angle=angle)
 
     def get_measure_result(self, node: int) -> bool:
         raise ValueError("Server cannot have access to measurement results")
 
     def set_measure_result(self, node: int, result: bool) -> None:
-        if self.__client.secrets.r:
-            result ^= self.__client.secrets.r[node]
+        if self.__client.secret_datas.r:
+            result ^= self.__client.secret_datas.r[node]
+        self.__client.results[node] = result
+
+
+class TestMeasureMethod(MeasureMethod):
+    def __init__(self, client: Client):
+        self.__client = client
+
+    def get_measurement_description(self, cmd: BaseM) -> Measurement:
+        # Blind the angle using the Client's secrets
+        angle = self.__client.secret_datas.blind_angle(cmd.node, cmd.node in self.__client.output_nodes, test=True)
+
+        return Measurement(plane=Plane.XY, angle=angle)
+
+    def get_measure_result(self, node: int) -> bool:
+        raise ValueError("Server cannot have access to measurement results")
+
+    def set_measure_result(self, node: int, result: bool) -> None:
+        if self.__client.secret_datas.r:
+            result ^= self.__client.secret_datas.r[node]
         self.__client.results[node] = result

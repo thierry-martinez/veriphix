@@ -1,0 +1,8 @@
+*~
+__pycache__/
+/.tox/
+/veriphix.egg-info/
+/circuits**
+.DS_Store
+.vscode/settings.json
+*.ipynb

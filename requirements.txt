@@ -1,0 +1,12 @@
+graphix @ git+https://github.com/thierry-martinez/graphix@prepare-method
+stim>=1.13,<2
+
+# For sampling circuits
+gitpython
+qiskit
+qiskit_aer
+typer
+
+# For cluster
+dask[distributed]
+dask_jobqueue
