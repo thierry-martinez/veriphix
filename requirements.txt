@@ -6,3 +6,6 @@ gitpython
 qiskit
 qiskit_aer
 typer
+
+# Tests (should be moved to requirements-dev.txt)
+graphix-qasm-parser
