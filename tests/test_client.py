@@ -84,7 +84,7 @@ class TestClient:
             pattern = circuit.transpile().pattern
             pattern.standardize()
 
-            state = circuit.simulate().statevec
+            state = circuit.simulate().state
 
             backend = StatevectorBackend()
             # Initialize the client
@@ -118,7 +118,7 @@ class TestClient:
             blinded_simulation = backend.state
 
             # Clear simulation = no secret, just simulate the circuit defined above
-            clear_simulation = circuit.simulate().statevec
+            clear_simulation = circuit.simulate().state
 
             np.testing.assert_almost_equal(
                 np.abs(np.dot(blinded_simulation.psi.flatten().conjugate(), clear_simulation.psi.flatten())), 1
@@ -147,7 +147,7 @@ class TestClient:
             blinded_simulation = backend.state
 
             # Clear simulation = no secret, just simulate the circuit defined above
-            clear_simulation = circuit.simulate().statevec
+            clear_simulation = circuit.simulate().state
             np.testing.assert_almost_equal(
                 np.abs(np.dot(blinded_simulation.psi.flatten().conjugate(), clear_simulation.psi.flatten())), 1
             )
@@ -229,7 +229,7 @@ class TestClient:
             blinded_simulation = backend.state
 
             # Clear simulation = no secret, just simulate the circuit defined above
-            clear_simulation = circuit.simulate().statevec
+            clear_simulation = circuit.simulate().state
             np.testing.assert_almost_equal(
                 np.abs(np.dot(blinded_simulation.psi.flatten().conjugate(), clear_simulation.psi.flatten())), 1
             )
